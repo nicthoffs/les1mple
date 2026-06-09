@@ -1,0 +1,7 @@
+[project]
+name = "les1mple"
+version = "0.1.0"
+description = "LeS1mple: A Hierarchical JEPA World Model for Long-Horizon Multi-Agent Dynamics in Counter-Strike"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
