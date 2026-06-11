@@ -8,3 +8,19 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local data/cache artifacts
+/.cache/
+/data/
+
+# Local training outputs
+/runs/
+/outputs/
+/lightning_logs/
+/wandb/
+/hf_exports/

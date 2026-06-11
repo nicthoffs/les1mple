@@ -1,33 +1,130 @@
-# LeS1mple: A Hierarchical JEPA World Model for Long-Horizon Multi-Agent Dynamics in Counter-Strike
+# LeS1mple
 
-LeS1mple is a world model project for Counter-Strike. It uses the [OpenCS2 Dataset](https://huggingface.co/datasets/blanchon/opencs2_dataset), which provides thousands of hours of tick-aligned video, audio, input actions, and world state. The goal is to learn a predictive, latent state-action representation of gameplay that can be used for planning.
+LeS1mple is a world model project for Counter-Strike. It trains predictive latent state-action models on the [OpenCS2 Dataset](https://huggingface.co/datasets/blanchon/opencs2_dataset), which provides tick-aligned POV video, audio, input actions, and world state.
 
-The name is a portmanteau of S1mple, arguably the greatest CS player ever, and [LeWorldModel](https://arxiv.org/abs/2603.19312), a Joint Embedding Predictive Architecture (JEPA) that leverages a stable, effective, and very simple training objective.
+The goal is to learn a compact representation of gameplay dynamics that can support long-horizon prediction and planning in a partially observable, multi-agent environment.
 
-I chose CS because it is a challenging, partially observable, multi-agent environment that requires complex strategy, quick reaction times, and an efficient architecture, as the state-action space is quite large.
+## Architecture
 
-# Architecture design
+The current model follows a LeWM-style JEPA setup:
 
-One key design decision is the choice of state. What do we leave to the encoder and what do we leave to the predictor? Ideally the encoder should contain all relevant information that a real player can access/would want during a round. So this includes the current tick state and recollection of prior events like seeing a player. 
+- The encoder observes the current POV frame and produces a latent embedding of current visual evidence.
+- The predictor consumes a history of visual latents and action embeddings, then predicts future visual latents.
+- Actions condition the predictor through AdaLN-style modulation.
+- SIGReg regularizes the latent space during training.
 
-Consider a complex example. Imagine the agent spawns with the bomb on the terrorist side of Dust2 and witnesses the entire enemy team crossing Mid Doors towards the B site. The agent begins push A site to plant the bomb unobstructed by enemy players. When the player is about to peek Long, its latent should encode that it saw all the enemies go to B. During CEM planning, predicted future latents for the peek action should encode that no enemies were seen since this is the likely outcome.
+The encoder is intentionally smaller than the predictor. Memory, dynamics, and counterfactual futures should mostly live in the predictor rather than in a single-frame encoder.
 
-I think the encoder should just encode current evidence. The predictor should be the larger, more complex model which encodes memory, dynamics, and counterfactual futures. It will take a compressed history of past events that somehow persists this relevant context.
+## Repository Layout
 
-## Encoder input representation and model architecture
+```text
+src/les1mple/data/        dataset loading, cached sequence format, data transforms
+src/les1mple/models/      encoder, predictor, and LeWM construction
+src/les1mple/training/    shared training objective and dataset split helpers
+scripts/                  maintained data, train, and eval commands
+experiments/              quick smoke checks and scratch experiments
+```
 
-Our encoder encodes current evidence. It simply takes a POV frame.
+## Setup
 
-The encoder should be a fairly small VIT with a moderately sized embedding dimension.
+Use `uv` from the repo root. The training extra installs the stable-worldmodel stack:
 
-## Predictor Input Representation
+```bash
+uv --cache-dir /tmp/uv-cache run --extra train python experiments/smoke_dataset.py
+```
 
-The predictor should either be a state space model or transformer and it should be large relative to the encoder.
+## Data
 
-# Software stack
+The current cached OpenCS2 clip format is:
 
-I will use `timm` and `stable-worldmodel`.
+- 150 sampled frames
+- `frame_step=4` from 20 FPS preview videos, so 5 Hz
+- 30 seconds per clip
+- 224x224 RGB
+- uint8 cached pixels, normalized to float32 by the dataset at load time
 
-# Random quick notes
+Build or resume the preview cache:
 
-Quick note thoughts:  Perhaps training an omniscent world model first that could then densely supervise the player model to avoid CEM planning? 
+```bash
+uv --cache-dir /tmp/uv-cache run --extra train python scripts/fetch_opencs2_previews.py \
+  --num-samples 10000 \
+  --output-dir /home/nic/Work/les1mple/data/opencs2-preview-raw10000-seq150-step4 \
+  --cache-dir /home/nic/Work/les1mple/.cache/hf \
+  --max-candidates 50000 \
+  --min-duration-s 30 \
+  --max-preview-bytes 8000000 \
+  --sequence-length 150 \
+  --frame-step 4 \
+  --image-size 224 \
+  --sampling raw \
+  --seed 0
+```
+
+Cached pixels are stored as `uint8` to keep disk usage manageable. The dataset normalizes them to float32 at load time.
+
+## Training
+
+Short-horizon stability run:
+
+```bash
+uv --cache-dir /tmp/uv-cache run --extra train python scripts/train_lewm_opencs2.py \
+  --predictor-type mamba3 \
+  --data-dir /home/nic/Work/les1mple/data/opencs2-preview-raw1024-seq150-step4 \
+  --run-dir /tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step4-h146-b128-adaln-sigreg0.05-1000step \
+  --batch-size 128 \
+  --accumulate-grad-batches 1 \
+  --max-steps 1000 \
+  --history-size 146 \
+  --num-preds 4 \
+  --encoder-chunk-size 128 \
+  --checkpoint-encoder \
+  --sigreg-weight 0.05
+```
+
+Longer-horizon run candidate:
+
+```bash
+uv --cache-dir /tmp/uv-cache run --extra train python scripts/train_lewm_opencs2.py \
+  --predictor-type mamba3 \
+  --data-dir /home/nic/Work/les1mple/data/opencs2-preview-raw10000-seq150-step4 \
+  --run-dir /tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step4-h100-p50-b128-sigreg0.05 \
+  --batch-size 128 \
+  --accumulate-grad-batches 1 \
+  --max-steps 5000 \
+  --history-size 100 \
+  --num-preds 50 \
+  --encoder-chunk-size 128 \
+  --checkpoint-encoder \
+  --sigreg-weight 0.05
+```
+
+At 5 Hz, `history_size=100` gives 20 seconds of context and `num_preds=50` gives a 10 second target offset.
+
+## Evaluation
+
+Predictor retrieval compares predicted future latents against copy-last in latent space:
+
+```bash
+uv --cache-dir /tmp/uv-cache run --extra train python scripts/eval_lewm_retrieval.py \
+  --checkpoint /tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step4-h146-b128-adaln-sigreg0.05-1000step/final.pt \
+  --data-dir /home/nic/Work/les1mple/data/opencs2-preview-raw1024-seq150-step4 \
+  --output-dir /tmp/les1mple-eval/sigreg0.05_predictor \
+  --num-samples 122 \
+  --batch-size 16 \
+  --num-viz 12 \
+  --device cuda
+```
+
+Encoder retrieval checks latent geometry and nearest neighbors:
+
+```bash
+uv --cache-dir /tmp/uv-cache run --extra train python scripts/eval_encoder_retrieval.py \
+  --checkpoint /tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step4-h146-b128-adaln-sigreg0.05-1000step/final.pt \
+  --data-dir /home/nic/Work/les1mple/data/opencs2-preview-raw1024-seq150-step4 \
+  --output-dir /tmp/les1mple-eval/encoder \
+  --num-clips 64 \
+  --frames-per-clip 4 \
+  --batch-size 4 \
+  --num-viz 12 \
+  --device cpu
+```
