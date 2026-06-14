@@ -38,29 +38,30 @@ uv --cache-dir /tmp/uv-cache run --extra train python experiments/smoke_dataset.
 The current cached OpenCS2 clip format is:
 
 - 150 sampled frames
-- `frame_step=4` from 20 FPS preview videos, so 5 Hz
-- 30 seconds per clip
+- `frame_step=6` from 32 FPS full POV videos, so about 5.33 Hz
+- about 28 seconds per clip
 - 224x224 RGB
 - uint8 cached pixels, normalized to float32 by the dataset at load time
 
-Build or resume the preview cache:
+Build or resume the full-video cache:
 
 ```bash
-uv --cache-dir /tmp/uv-cache run --extra train python scripts/fetch_opencs2_previews.py \
+uv --cache-dir /tmp/uv-cache run --extra train python scripts/fetch_opencs2_videos.py \
   --num-samples 10000 \
-  --output-dir /home/nic/Work/les1mple/data/opencs2-preview-raw10000-seq150-step4 \
+  --output-dir /home/nic/Work/les1mple/data/opencs2-full-raw10000-seq150-step6 \
   --cache-dir /home/nic/Work/les1mple/.cache/hf \
   --max-candidates 50000 \
   --min-duration-s 30 \
-  --max-preview-bytes 8000000 \
+  --max-media-bytes 100000000 \
   --sequence-length 150 \
-  --frame-step 4 \
+  --frame-step 6 \
   --image-size 224 \
   --sampling raw \
   --seed 0
 ```
 
 Cached pixels are stored as `uint8` to keep disk usage manageable. The dataset normalizes them to float32 at load time.
+The fetcher uses `blanchon/opencs2_dataset_wds` and reads selected MP4/tick members by byte range from tar shards, so source videos are not cached as loose files. Existing `.pt` files in the output directory are skipped, so rerunning this command with the same output directory adds new samples instead of overwriting or duplicating existing media IDs.
 
 ## Training
 
@@ -75,7 +76,6 @@ uv --cache-dir /tmp/uv-cache run --extra train python scripts/train_lewm_opencs2
   --accumulate-grad-batches 1 \
   --max-steps 1000 \
   --history-size 146 \
-  --num-preds 4 \
   --encoder-chunk-size 128 \
   --checkpoint-encoder \
   --sigreg-weight 0.05
@@ -86,19 +86,26 @@ Longer-horizon run candidate:
 ```bash
 uv --cache-dir /tmp/uv-cache run --extra train python scripts/train_lewm_opencs2.py \
   --predictor-type mamba3 \
-  --data-dir /home/nic/Work/les1mple/data/opencs2-preview-raw10000-seq150-step4 \
-  --run-dir /tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step4-h100-p50-b128-sigreg0.05 \
+  --data-dir /home/nic/Work/les1mple/data/opencs2-full-raw10000-seq150-step6 \
+  --run-dir /tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step6-h100-p50-b128-sigreg0.05 \
   --batch-size 128 \
   --accumulate-grad-batches 1 \
   --max-steps 5000 \
   --history-size 100 \
-  --num-preds 50 \
   --encoder-chunk-size 128 \
   --checkpoint-encoder \
   --sigreg-weight 0.05
 ```
 
-At 5 Hz, `history_size=100` gives 20 seconds of context and `num_preds=50` gives a 10 second target offset.
+The target horizon is derived as `sequence_length - history_size`. At about 5.33 Hz with `sequence_length=150`, `history_size=100` gives 18.75 seconds of context and `target_horizon=50` gives a 9.375 second target offset.
+
+Maintained transformer overnight run:
+
+```bash
+./scripts/run_transformer_h149_p1_overnight.sh
+```
+
+The maintained script defaults to the current fast data path: cached pixels stay `uint8` through DataLoader, `torch.load(..., mmap=True)` is used for cached `.pt` files, train workers use `num_workers=4,prefetch=1`, validation is limited to 4 batches, W&B logs go under the run directory, and run outputs default to repo-local `runs/`.
 
 ## Evaluation
 

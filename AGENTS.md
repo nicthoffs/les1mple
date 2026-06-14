@@ -2,7 +2,7 @@
 
 ## Project
 
-LeS1mple is a hierarchical JEPA world model for long-horizon Counter-Strike dynamics. It uses OpenCS2 preview clips and actions to train a latent predictor for POV gameplay.
+LeS1mple is a hierarchical JEPA world model for long-horizon Counter-Strike dynamics. It uses OpenCS2 POV video clips and actions to train a latent predictor for POV gameplay.
 
 The encoder sees only the current POV frame. Do not expect it to encode hidden long-term memory. The predictor is responsible for memory, dynamics, and counterfactual futures.
 
@@ -30,33 +30,36 @@ uv --cache-dir /tmp/uv-cache run --extra train python experiments/train_lewm_smo
 
 ## Important Paths
 
-- Current 10k cache target: `/home/nic/Work/les1mple/data/opencs2-preview-raw10000-seq150-step4`
+- Current 10k cache target: `/home/nic/Work/les1mple/data/opencs2-full-raw10000-seq150-step6`
 - Completed 1.2k cache: `/home/nic/Work/les1mple/data/opencs2-preview-raw1024-seq150-step4`
 - Short-horizon `sigreg=0.05` run: `/tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step4-h146-b128-adaln-sigreg0.05-1000step`
 
 ## Current Clip Setup
 
-- OpenCS2 preview videos are 20 FPS.
-- `frame_step=4` gives 5 Hz.
-- `sequence_length=150` gives 30 second clips.
+- OpenCS2 full videos are 32 FPS.
+- `frame_step=6` gives about 5.33 Hz.
+- `sequence_length=150` gives about 28 second clips.
 - New cached clips should store pixels as `uint8`; `LocalTensorSequenceDataset` normalizes them to float32 on load.
-- `history_size=146`, `num_preds=4` is 29.2 seconds of context and only a 0.8 second target offset.
-- A better long-horizon target is `history_size=100`, `num_preds=50`, which is 20 seconds of context and a 10 second target offset.
+- `history_size=146` on `sequence_length=150` derives `target_horizon=4`, giving 29.2 seconds of context and only a 0.8 second target offset.
+- A better long-horizon target is `history_size=100` on `sequence_length=150`, which derives `target_horizon=50` for about 18.75 seconds of context and a 9.375 second target offset.
 
 ## Data Notes
 
-- The 5 MB preview cap with 30 second clips only yielded 583 candidates.
-- Use `--max-preview-bytes 8000000` for the 10k cache.
+- Full videos avoid the action-overlay UI baked into preview clips.
+- Fetch full videos from `blanchon/opencs2_dataset_wds` by byte range, not from the loose-file preview dataset.
+- Use `--max-media-bytes 100000000` for the 10k full-video cache.
 - Old float32 cached clips are large: expect roughly 800-900 GB for 10k clips.
 - New caches always store pixels as `uint8`; shard/compress later if needed.
 
 ## Common Commands
 
 ```bash
-find /home/nic/Work/les1mple/data/opencs2-preview-raw10000-seq150-step4 -name '*.pt' | wc -l
-du -sh /home/nic/Work/les1mple/data/opencs2-preview-raw10000-seq150-step4
-tail -n 30 /tmp/les1mple-runs/opencs2-lewm-mamba3-seq150-step4-h146-b128-adaln-sigreg0.05-1000step/metrics.csv
+find /home/nic/Work/les1mple/data/opencs2-full-raw10000-seq150-step6 -name '*.pt' | wc -l
+du -sh /home/nic/Work/les1mple/data/opencs2-full-raw10000-seq150-step6
+./scripts/run_transformer_h149_p1_overnight.sh
 ```
+
+Current fast maintained path uses `uint8` cached pixels, `--mmap-load`, `bf16-mixed`, `--channels-last`, train `num_workers=4`, `prefetch_factor=1`, limited validation batches, W&B logging, and repo-local `runs/` output.
 
 ## Coding Style
 

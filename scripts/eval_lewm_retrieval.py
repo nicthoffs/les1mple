@@ -31,6 +31,9 @@ def main() -> None:
     checkpoint_path = Path(args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     train_args = SimpleNamespace(**checkpoint["args"])
+    target_horizon = getattr(train_args, "target_horizon", None)
+    if target_horizon is None:
+        target_horizon = train_args.num_preds
     if args.data_dir is not None:
         train_args.data_dir = args.data_dir
 
@@ -71,7 +74,7 @@ def main() -> None:
             ctx_act = act_emb[:, : train_args.history_size]
             pred = model.predict(ctx_emb, ctx_act)[:, -1]
             copy = ctx_emb[:, -1]
-            target = emb[:, train_args.history_size - 1 + train_args.num_preds]
+            target = emb[:, train_args.history_size - 1 + target_horizon]
 
             pixels = batch["pixels"].detach().cpu()
             sample_ids = list(batch["sample_id"])
@@ -84,7 +87,7 @@ def main() -> None:
                         "target": target[index].detach().cpu(),
                         "context_frame": pixels[index, train_args.history_size - 1],
                         "target_frame": pixels[
-                            index, train_args.history_size - 1 + train_args.num_preds
+                            index, train_args.history_size - 1 + target_horizon
                         ],
                     }
                 )

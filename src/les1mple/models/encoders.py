@@ -7,6 +7,53 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 
+def vit_hf(
+    *,
+    size: str,
+    patch_size: int,
+    image_size: int,
+    pretrained: bool,
+    use_mask_token: bool,
+) -> nn.Module:
+    from transformers import ViTConfig, ViTModel
+
+    size_configs = {
+        "tiny": {"hidden_size": 192, "num_hidden_layers": 12, "num_attention_heads": 3},
+        "small": {"hidden_size": 384, "num_hidden_layers": 12, "num_attention_heads": 6},
+        "base": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12},
+        "large": {
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+        },
+        "huge": {
+            "hidden_size": 1280,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 16,
+        },
+    }
+    if size not in size_configs:
+        raise ValueError(f"unknown ViT size {size!r}")
+
+    if pretrained:
+        model_name = f"google/vit-{size}-patch{patch_size}-{image_size}"
+        model = ViTModel.from_pretrained(
+            model_name,
+            add_pooling_layer=False,
+            use_mask_token=use_mask_token,
+        )
+    else:
+        config_params = dict(size_configs[size])
+        config_params["intermediate_size"] = config_params["hidden_size"] * 4
+        config_params["image_size"] = image_size
+        config_params["patch_size"] = patch_size
+        config = ViTConfig(**config_params)
+        model = ViTModel(config, add_pooling_layer=False, use_mask_token=use_mask_token)
+
+    model.config.interpolate_pos_encoding = True
+    return model
+
+
 class TinyEncoder(nn.Module):
     def __init__(self, emb_dim: int) -> None:
         super().__init__()

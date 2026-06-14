@@ -22,7 +22,6 @@ def main() -> None:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--history-size", type=int, default=4)
-    parser.add_argument("--num-preds", type=int, default=4)
     parser.add_argument("--emb-dim", type=int, default=64)
     parser.add_argument("--encoder", choices=("tiny-cnn", "timm"), default="tiny-cnn")
     parser.add_argument("--timm-model", default="vit_tiny_patch16_224")
@@ -41,8 +40,11 @@ def main() -> None:
     else:
         dataset = LocalTensorSequenceDataset(args.data_dir)
 
-    if args.history_size + args.num_preds > args.sequence_length:
-        raise SystemExit("history-size + num-preds must fit inside sequence-length")
+    if args.history_size < 1:
+        raise SystemExit("--history-size must be positive")
+    if args.history_size >= args.sequence_length:
+        raise SystemExit("--history-size must be smaller than --sequence-length")
+    args.target_horizon = args.sequence_length - args.history_size
 
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     try:
@@ -50,10 +52,10 @@ def main() -> None:
     except StopIteration:
         raise SystemExit("dataset is too small for the requested batch size")
 
-    if batch["pixels"].shape[1] < args.history_size + args.num_preds:
+    if batch["pixels"].shape[1] != args.sequence_length:
         raise SystemExit(
-            f"batch sequence length {batch['pixels'].shape[1]} is too short for "
-            f"history-size={args.history_size}, num-preds={args.num_preds}"
+            f"batch sequence length {batch['pixels'].shape[1]} does not match "
+            f"sequence-length={args.sequence_length}"
         )
 
     if args.encoder == "tiny-cnn":
@@ -106,7 +108,7 @@ def main() -> None:
 
         ctx_emb = emb[:, : args.history_size]
         ctx_act = act_emb[:, : args.history_size]
-        tgt_emb = emb[:, args.num_preds : args.num_preds + args.history_size].detach()
+        tgt_emb = emb[:, args.target_horizon :].detach()
         pred_emb = model.predict(ctx_emb, ctx_act)
 
         loss = (pred_emb - tgt_emb).pow(2).mean()
@@ -140,6 +142,7 @@ def main() -> None:
     print(f"action: {tuple(batch['action'].shape)}")
     print(f"embedding: {tuple(emb.shape)}")
     print(f"prediction: {tuple(pred_emb.shape)}")
+    print(f"target_horizon: {args.target_horizon}")
 
 
 if __name__ == "__main__":

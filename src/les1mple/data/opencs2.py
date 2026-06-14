@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 from typing import Any
 
 
@@ -94,8 +95,18 @@ class LocalTensorSequenceDataset:
     - ``action``: float tensor shaped ``T,A``
     """
 
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(
+        self,
+        data_dir: str | Path,
+        *,
+        pixel_dtype: str = "float32",
+        mmap_load: bool = False,
+    ) -> None:
+        if pixel_dtype not in {"float32", "uint8"}:
+            raise ValueError(f"unknown pixel dtype {pixel_dtype!r}")
         self.data_dir = Path(data_dir)
+        self.pixel_dtype = pixel_dtype
+        self.mmap_load = mmap_load
         self.files = sorted(self.data_dir.glob("*.pt"))
         if not self.files:
             raise FileNotFoundError(f"no .pt sequence files found in {self.data_dir}")
@@ -107,11 +118,36 @@ class LocalTensorSequenceDataset:
         torch = _require_torch()
 
         path = self.files[index]
-        sample = torch.load(path, map_location="cpu", weights_only=True)
+        sample = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=self.mmap_load,
+        )
         _validate_sample(sample, sample_id=str(path))
-        sample["pixels"] = _normalize_pixels_for_model(sample["pixels"])
+        sample["pixels"] = _normalize_pixels_for_model(
+            sample["pixels"],
+            pixel_dtype=self.pixel_dtype,
+        )
         sample.setdefault("sample_id", path.stem)
         return sample
+
+    def action_at(self, index: int):
+        torch = _require_torch()
+
+        path = self.files[index]
+        sample = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=self.mmap_load,
+        )
+        action = sample.get("action") if isinstance(sample, dict) else None
+        if not isinstance(action, torch.Tensor):
+            raise TypeError(f"{path}: action must be a tensor")
+        if action.ndim != 2:
+            raise ValueError(f"{path}: action must have shape T,A")
+        return action
 
 
 def build_local_sequence(
@@ -172,9 +208,26 @@ def build_local_sequence(
     }
     _validate_sample(sample, sample_id=str(video_path))
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(sample, output_path)
+    _atomic_torch_save(torch, sample, output_path)
     return sample
+
+
+def _atomic_torch_save(torch: Any, sample: dict[str, object], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+    try:
+        torch.save(sample, temp_path)
+        temp_path.replace(output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def _read_video_frames(
@@ -199,9 +252,13 @@ def _read_video_frames(
             capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             ok, frame = capture.read()
             if not ok:
-                raise ValueError(f"could not read frame {frame_index} from {video_path}")
+                raise ValueError(
+                    f"could not read frame {frame_index} from {video_path}"
+                )
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
+            frame = cv2.resize(
+                frame, (image_size, image_size), interpolation=cv2.INTER_AREA
+            )
             tensor = torch.from_numpy(frame).permute(2, 0, 1).contiguous()
             frames.append(tensor)
 
@@ -255,7 +312,9 @@ def _encode_actions(
         pitch = _first_existing_column(tick_rows, PITCH_COLUMNS)
         if yaw and pitch:
             yaw_values = torch.tensor(tick_rows[yaw].to_numpy(), dtype=torch.float32)
-            pitch_values = torch.tensor(tick_rows[pitch].to_numpy(), dtype=torch.float32)
+            pitch_values = torch.tensor(
+                tick_rows[pitch].to_numpy(), dtype=torch.float32
+            )
             action[1:, 0] = yaw_values[1:] - yaw_values[:-1]
             action[1:, 1] = pitch_values[1:] - pitch_values[:-1]
 
@@ -317,9 +376,11 @@ def _validate_sample(sample: object, *, sample_id: str) -> None:
         raise TypeError(f"{sample_id}: pixels must be uint8 or floating point")
 
 
-def _normalize_pixels_for_model(pixels):
+def _normalize_pixels_for_model(pixels, *, pixel_dtype: str = "float32"):
     torch = _require_torch()
 
+    if pixel_dtype == "uint8" and pixels.dtype == torch.uint8:
+        return pixels
     if pixels.dtype == torch.uint8:
         return pixels.float() / 255.0
     return pixels.float()

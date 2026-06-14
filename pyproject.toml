@@ -15,7 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
-    "stable-worldmodel[train]",
+    "lightning",
+    "stable-worldmodel",
+    "timm",
+    "transformers",
+    "wandb",
 ]
 
 [build-system]
