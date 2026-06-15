@@ -9,7 +9,11 @@ import torch
 from stable_worldmodel.wm.loss import SIGReg
 from torch.optim.lr_scheduler import LRScheduler
 
-from les1mple.training.objectives import hwm_forward, lejepa_forward
+from les1mple.training.objectives import (
+    causal_multi_horizon_forward,
+    hwm_forward,
+    lejepa_forward,
+)
 
 
 class LinearWarmupCosineAnnealingLR(LRScheduler):
@@ -241,6 +245,138 @@ class HierarchicalLeWMLightningModule(pl.LightningModule):
         parameters = [p for p in self.model.parameters() if p.requires_grad]
         if not parameters:
             raise RuntimeError("HWM has no trainable parameters")
+        optimizer = torch.optim.AdamW(
+            parameters,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            fused=_resolve_adamw_fused(self.adamw_fused),
+        )
+        scheduler = LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_steps=self.warmup_steps,
+            max_steps=self.max_steps,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
+
+
+class CausalMultiHorizonLeWMLightningModule(pl.LightningModule):
+    def __init__(
+        self,
+        *,
+        model: torch.nn.Module,
+        horizons: tuple[int, ...],
+        num_positions: int,
+        loss_type: str,
+        sigreg_weight: float,
+        sigreg_knots: int,
+        sigreg_num_proj: int,
+        sigreg_frame_stride: int,
+        lr: float,
+        weight_decay: float,
+        warmup_steps: int,
+        max_steps: int,
+        hparams: Mapping[str, Any],
+        adamw_fused: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.horizons = horizons
+        self.num_positions = num_positions
+        self.loss_type = loss_type
+        self.sigreg_weight = sigreg_weight
+        self.sigreg_frame_stride = sigreg_frame_stride
+        self.sigreg = (
+            SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
+            if sigreg_weight > 0
+            else None
+        )
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.adamw_fused = adamw_fused
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.save_hyperparameters(dict(hparams), ignore=("model",))
+
+    def training_step(self, batch, batch_idx):
+        del batch_idx
+        output = causal_multi_horizon_forward(
+            self,
+            batch,
+            horizons=self.horizons,
+            num_positions=self.num_positions,
+            loss_type=self.loss_type,
+            sigreg_weight=self.sigreg_weight,
+            sigreg_frame_stride=self.sigreg_frame_stride,
+        )
+        self._log_losses("fit", output, batch_size=_batch_size(batch))
+        return output
+
+    def validation_step(self, batch, batch_idx):
+        del batch_idx
+        output = causal_multi_horizon_forward(
+            self,
+            batch,
+            horizons=self.horizons,
+            num_positions=self.num_positions,
+            loss_type=self.loss_type,
+            sigreg_weight=self.sigreg_weight,
+            sigreg_frame_stride=self.sigreg_frame_stride,
+            eval_baselines=True,
+        )
+        self._log_losses("validate", output, batch_size=_batch_size(batch))
+        return output
+
+    def _log_losses(
+        self,
+        stage: str,
+        output: Mapping[str, Any],
+        *,
+        batch_size: int | None,
+    ) -> None:
+        on_step = stage == "fit"
+        on_epoch = stage != "fit"
+        for key, value in output.items():
+            if not (
+                key in {
+                    "raw_loss",
+                    "pred_loss",
+                    "sigreg_loss",
+                    "copy_last_loss",
+                    "shuffled_action_pred_loss",
+                    "zero_action_pred_loss",
+                    "pred_vs_copy_loss_improvement",
+                    "real_vs_shuffled_action_delta",
+                    "real_vs_zero_action_delta",
+                }
+                or key.startswith("pred_loss_h")
+                or key.startswith("copy_last_loss_h")
+                or key.startswith("shuffled_action_pred_loss_h")
+                or key.startswith("zero_action_pred_loss_h")
+                or key.startswith("pred_vs_copy_loss_improvement_h")
+                or key.startswith("real_vs_shuffled_action_delta_h")
+                or key.startswith("real_vs_zero_action_delta_h")
+            ):
+                continue
+            name = "loss" if key == "raw_loss" else key
+            self.log(
+                f"{stage}/{name}",
+                value,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=key == "raw_loss",
+                batch_size=batch_size,
+            )
+
+    def configure_optimizers(self):
+        parameters = [p for p in self.model.parameters() if p.requires_grad]
+        if not parameters:
+            raise RuntimeError("causal multi-horizon LeWM has no trainable parameters")
         optimizer = torch.optim.AdamW(
             parameters,
             lr=self.lr,

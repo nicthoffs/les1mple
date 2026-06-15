@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 
@@ -26,6 +25,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-viz", type=int, default=8)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--shuffle-seed", type=int, default=0)
     args = parser.parse_args()
 
     checkpoint_path = Path(args.checkpoint)
@@ -54,6 +54,8 @@ def main() -> None:
     model.load_state_dict(checkpoint["model"])
     model.to(device)
     model.eval()
+    shuffle_generator = torch.Generator(device=device)
+    shuffle_generator.manual_seed(args.shuffle_seed)
 
     records = []
     max_samples = min(args.num_samples, len(val_set))
@@ -73,6 +75,9 @@ def main() -> None:
             ctx_emb = emb[:, : train_args.history_size]
             ctx_act = act_emb[:, : train_args.history_size]
             pred = model.predict(ctx_emb, ctx_act)[:, -1]
+            shuffled_pred = model.predict(ctx_emb, _shuffle_batch(ctx_act, shuffle_generator))[
+                :, -1
+            ]
             copy = ctx_emb[:, -1]
             target = emb[:, train_args.history_size - 1 + target_horizon]
 
@@ -83,6 +88,7 @@ def main() -> None:
                     {
                         "sample_id": sample_ids[index],
                         "pred": pred[index].detach().cpu(),
+                        "shuffled_pred": shuffled_pred[index].detach().cpu(),
                         "copy": copy[index].detach().cpu(),
                         "target": target[index].detach().cpu(),
                         "context_frame": pixels[index, train_args.history_size - 1],
@@ -96,12 +102,12 @@ def main() -> None:
     metrics_path = output_dir / "retrieval_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
 
-    grid_path = output_dir / "retrieval_grid.png"
-    _save_retrieval_grid(records, retrieval, grid_path, num_viz=args.num_viz)
-
     print(json.dumps(metrics, indent=2))
     print(f"metrics: {metrics_path}")
-    print(f"grid: {grid_path}")
+    if args.num_viz > 0:
+        grid_path = output_dir / "retrieval_grid.png"
+        _save_retrieval_grid(records, retrieval, grid_path, num_viz=args.num_viz)
+        print(f"grid: {grid_path}")
 
 
 def _to_device(batch: dict[str, object], device: torch.device) -> dict[str, object]:
@@ -111,31 +117,58 @@ def _to_device(batch: dict[str, object], device: torch.device) -> dict[str, obje
     }
 
 
-def _compute_metrics(records: list[dict[str, object]]) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+def _shuffle_batch(tensor: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    batch_size = tensor.size(0)
+    if batch_size <= 1:
+        return tensor
+    permutation = torch.randperm(batch_size, device=tensor.device, generator=generator)
+    if torch.equal(permutation, torch.arange(batch_size, device=tensor.device)):
+        permutation = permutation.roll(1)
+    return tensor.index_select(0, permutation)
+
+
+def _compute_metrics(
+    records: list[dict[str, object]],
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
     pred = torch.stack([record["pred"] for record in records])
+    shuffled_pred = torch.stack([record["shuffled_pred"] for record in records])
     copy = torch.stack([record["copy"] for record in records])
     target = torch.stack([record["target"] for record in records])
 
     pred_scores = _cosine_scores(pred, target)
+    shuffled_scores = _cosine_scores(shuffled_pred, target)
     copy_scores = _cosine_scores(copy, target)
     pred_ranks = _true_ranks(pred_scores)
+    shuffled_ranks = _true_ranks(shuffled_scores)
     copy_ranks = _true_ranks(copy_scores)
 
     metrics = {
         "num_samples": len(records),
         "pred_mse": float((pred - target).pow(2).mean()),
+        "shuffled_action_pred_mse": float((shuffled_pred - target).pow(2).mean()),
         "copy_last_mse": float((copy - target).pow(2).mean()),
+        "action_shuffle_mse_delta": float(
+            (shuffled_pred - target).pow(2).mean() - (pred - target).pow(2).mean()
+        ),
         "pred_mean_rank": float(pred_ranks.float().mean()),
+        "shuffled_action_mean_rank": float(shuffled_ranks.float().mean()),
         "copy_last_mean_rank": float(copy_ranks.float().mean()),
+        "pred_mrr": float((1.0 / pred_ranks.float()).mean()),
+        "shuffled_action_mrr": float((1.0 / shuffled_ranks.float()).mean()),
+        "copy_last_mrr": float((1.0 / copy_ranks.float()).mean()),
         "pred_top1": float((pred_ranks <= 1).float().mean()),
+        "shuffled_action_top1": float((shuffled_ranks <= 1).float().mean()),
         "copy_last_top1": float((copy_ranks <= 1).float().mean()),
         "pred_top5": float((pred_ranks <= 5).float().mean()),
+        "shuffled_action_top5": float((shuffled_ranks <= 5).float().mean()),
         "copy_last_top5": float((copy_ranks <= 5).float().mean()),
     }
     retrieval = {
         "pred_nn": pred_scores.argmax(dim=1),
+        "shuffled_action_nn": shuffled_scores.argmax(dim=1),
         "copy_nn": copy_scores.argmax(dim=1),
         "pred_ranks": pred_ranks,
+        "shuffled_action_ranks": shuffled_ranks,
         "copy_ranks": copy_ranks,
     }
     return metrics, retrieval
@@ -159,6 +192,8 @@ def _save_retrieval_grid(
     *,
     num_viz: int,
 ) -> None:
+    import matplotlib.pyplot as plt
+
     count = min(num_viz, len(records))
     fig, axes = plt.subplots(count, 4, figsize=(8, 2 * count))
     if count == 1:

@@ -85,3 +85,160 @@ def hwm_forward(
         "macro_stride": macro_stride,
         "num_waypoints": int(waypoint_indices.numel()),
     }
+
+
+def causal_multi_horizon_forward(
+    self,
+    batch,
+    *,
+    horizons: tuple[int, ...],
+    num_positions: int,
+    loss_type: str,
+    sigreg_weight: float = 0.0,
+    sigreg_frame_stride: int = 1,
+    eval_baselines: bool = False,
+):
+    if not horizons:
+        raise ValueError("horizons must not be empty")
+    if min(horizons) < 1:
+        raise ValueError("horizons must be positive")
+    if len(set(horizons)) != len(horizons):
+        raise ValueError("horizons must be unique")
+    if num_positions < 1:
+        raise ValueError("num_positions must be positive")
+    if sigreg_weight < 0:
+        raise ValueError("sigreg_weight must be non-negative")
+    if sigreg_frame_stride < 1:
+        raise ValueError("sigreg_frame_stride must be positive")
+
+    pixels = batch["pixels"]
+    action = batch["action"].nan_to_num_(0.0)
+    sequence_length = pixels.shape[1]
+    max_horizon = max(horizons)
+    if num_positions + max_horizon > sequence_length:
+        raise ValueError(
+            "num positions plus max horizon must fit in sequence: "
+            f"sequence_length={sequence_length} "
+            f"num_positions={num_positions} "
+            f"max_horizon={max_horizon}"
+        )
+
+    z_all = self.model.encode_latents(pixels)
+    z_prefix = z_all[:, :num_positions]
+    losses = []
+    copy_losses = []
+    shuffled_losses = []
+    zero_losses = []
+    output = {
+        "num_positions": num_positions,
+        "max_horizon": max_horizon,
+    }
+    for horizon in horizons:
+        action_windows = _causal_action_windows(
+            action,
+            num_positions=num_positions,
+            horizon=horizon,
+        )
+        z_target = z_all[:, horizon : horizon + num_positions].detach()
+        z_pred = self.model.predict_horizon(z_prefix, action_windows, horizon)
+        pred_loss_per = _latent_loss_per_step(z_pred, z_target, loss_type)
+        pred_loss_h = pred_loss_per.mean()
+        output[f"pred_loss_h{horizon}"] = pred_loss_h
+        losses.append(pred_loss_h)
+
+        if eval_baselines:
+            copy_loss_h = _latent_loss_per_step(z_prefix, z_target, loss_type).mean()
+            shuffled_pred = self.model.predict_horizon(
+                z_prefix,
+                _rolled_action_chunks(action_windows),
+                horizon,
+            )
+            shuffled_loss_h = _latent_loss_per_step(
+                shuffled_pred,
+                z_target,
+                loss_type,
+            ).mean()
+            zero_pred = self.model.predict_horizon(
+                z_prefix,
+                torch.zeros_like(action_windows),
+                horizon,
+            )
+            zero_loss_h = _latent_loss_per_step(zero_pred, z_target, loss_type).mean()
+            output[f"copy_last_loss_h{horizon}"] = copy_loss_h
+            output[f"shuffled_action_pred_loss_h{horizon}"] = shuffled_loss_h
+            output[f"zero_action_pred_loss_h{horizon}"] = zero_loss_h
+            output[f"pred_vs_copy_loss_improvement_h{horizon}"] = (
+                1.0 - pred_loss_h / copy_loss_h.clamp_min(1e-12)
+            )
+            output[f"real_vs_shuffled_action_delta_h{horizon}"] = (
+                shuffled_loss_h - pred_loss_h
+            )
+            output[f"real_vs_zero_action_delta_h{horizon}"] = zero_loss_h - pred_loss_h
+            copy_losses.append(copy_loss_h)
+            shuffled_losses.append(shuffled_loss_h)
+            zero_losses.append(zero_loss_h)
+
+    pred_loss = torch.stack(losses).mean()
+    raw_loss = pred_loss
+    output["pred_loss"] = pred_loss
+
+    if eval_baselines:
+        copy_loss = torch.stack(copy_losses).mean()
+        shuffled_loss = torch.stack(shuffled_losses).mean()
+        zero_loss = torch.stack(zero_losses).mean()
+        output["copy_last_loss"] = copy_loss
+        output["shuffled_action_pred_loss"] = shuffled_loss
+        output["zero_action_pred_loss"] = zero_loss
+        output["pred_vs_copy_loss_improvement"] = (
+            1.0 - pred_loss / copy_loss.clamp_min(1e-12)
+        )
+        output["real_vs_shuffled_action_delta"] = shuffled_loss - pred_loss
+        output["real_vs_zero_action_delta"] = zero_loss - pred_loss
+
+    if sigreg_weight > 0:
+        sigreg_emb = z_all[:, ::sigreg_frame_stride]
+        sigreg_loss = self.sigreg(sigreg_emb.transpose(0, 1))
+        raw_loss = raw_loss + sigreg_weight * sigreg_loss
+        output["sigreg_loss"] = sigreg_loss
+
+    output["loss"] = raw_loss
+    output["raw_loss"] = raw_loss
+    return output
+
+
+def _causal_action_windows(
+    action: torch.Tensor,
+    *,
+    num_positions: int,
+    horizon: int,
+) -> torch.Tensor:
+    return torch.stack(
+        [
+            action[
+                :,
+                offset : offset + num_positions,
+            ]
+            for offset in range(horizon)
+        ],
+        dim=2,
+    )
+
+
+def _latent_loss_per_step(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    if loss_type == "l1":
+        return (pred - target).abs().mean(dim=-1)
+    if loss_type == "mse":
+        return (pred - target).pow(2).mean(dim=-1)
+    raise ValueError(f"unknown loss type {loss_type!r}")
+
+
+def _rolled_action_chunks(action_chunks: torch.Tensor) -> torch.Tensor:
+    batch_size, num_chunks = action_chunks.shape[:2]
+    if batch_size * num_chunks <= 1:
+        return action_chunks
+    flat = action_chunks.flatten(0, 1)
+    return flat.roll(shifts=1, dims=0).reshape_as(action_chunks)
