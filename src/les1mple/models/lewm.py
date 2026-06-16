@@ -11,7 +11,6 @@ from torch import nn
 
 from les1mple.data import action_dim
 from les1mple.models.encoders import ChunkedEncoder, TimmEncoder, TinyEncoder, vit_hf
-from les1mple.models.hwm import HierarchicalLeWM, build_hierarchical_lewm
 from les1mple.models.predictors import OfficialMamba3Predictor
 
 
@@ -62,43 +61,6 @@ def build_lewm_model(args: argparse.Namespace | SimpleNamespace) -> LeWM:
             norm_fn=nn.BatchNorm1d,
         ),
         channels_last=getattr(args, "channels_last", False),
-    )
-
-
-def build_hierarchical_lewm_model(
-    args: argparse.Namespace | SimpleNamespace,
-    *,
-    low: LeWM | None = None,
-) -> HierarchicalLeWM:
-    if low is None:
-        low = build_lewm_model(args)
-    return build_hierarchical_lewm(
-        low=low,
-        action_dim=action_dim(),
-        emb_dim=args.emb_dim,
-        high_context_size=getattr(args, "high_context_size", args.history_size),
-        action_smoothed_dim=getattr(
-            args, "macro_action_smoothed_dim", args.action_smoothed_dim
-        ),
-        predictor_depth=getattr(args, "high_predictor_depth", args.predictor_depth),
-        predictor_heads=getattr(args, "high_predictor_heads", args.predictor_heads),
-        predictor_mlp_dim=getattr(
-            args, "high_predictor_mlp_dim", args.predictor_mlp_dim
-        ),
-        predictor_dim_head=getattr(
-            args, "high_predictor_dim_head", args.predictor_dim_head
-        ),
-        predictor_dropout=getattr(
-            args, "high_predictor_dropout", args.predictor_dropout
-        ),
-        predictor_emb_dropout=getattr(
-            args, "high_predictor_emb_dropout", args.predictor_emb_dropout
-        ),
-        projection_hidden_dim=getattr(
-            args, "high_projection_hidden_dim", args.projection_hidden_dim
-        ),
-        macro_pooling=getattr(args, "macro_action_pooling", "mean"),
-        freeze_low=getattr(args, "freeze_low", True),
     )
 
 

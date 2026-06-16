@@ -2,7 +2,7 @@
 
 ## Project
 
-LeS1mple is a hierarchical JEPA world model for long-horizon Counter-Strike dynamics. It uses OpenCS2 POV video clips and actions to train a latent predictor for POV gameplay.
+LeS1mple is a JEPA world model for long-horizon Counter-Strike dynamics. It uses OpenCS2 POV video clips and actions to train a latent predictor for POV gameplay.
 
 The encoder sees only the current POV frame. Do not expect it to encode hidden long-term memory. The predictor is responsible for memory, dynamics, and counterfactual futures.
 
